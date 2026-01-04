@@ -1,0 +1,257 @@
+---
+stages:
+  - build
+  - test
+  - security
+  - package
+  - deploy
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  REGISTRY_URL: registry.gitlab.com
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+
+# Define services that need to be built
+.service_template: &service_definition
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+
+# Microservice: API Gateway
+build:api-gateway:
+  <<: *service_definition
+  stage: build
+  script:
+    - cd services/api-gateway
+    - docker build -t $CI_REGISTRY_IMAGE/api-gateway:$CI_COMMIT_SHORT_SHA .
+    - docker push $CI_REGISTRY_IMAGE/api-gateway:$CI_COMMIT_SHORT_SHA
+  only:
+    changes:
+      - services/api-gateway/**/*
+
+# Microservice: User Service
+build:user-service:
+  <<: *service_definition
+  stage: build
+  script:
+    - cd services/user-service
+    - docker build -t $CI_REGISTRY_IMAGE/user-service:$CI_COMMIT_SHORT_SHA .
+    - docker push $CI_REGISTRY_IMAGE/user-service:$CI_COMMIT_SHORT_SHA
+  only:
+    changes:
+      - services/user-service/**/*
+
+# Microservice: Order Service
+build:order-service:
+  <<: *service_definition
+  stage: build
+  script:
+    - cd services/order-service
+    - docker build -t $CI_REGISTRY_IMAGE/order-service:$CI_COMMIT_SHORT_SHA .
+    - docker push $CI_REGISTRY_IMAGE/order-service:$CI_COMMIT_SHORT_SHA
+  only:
+    changes:
+      - services/order-service/**/*
+
+# Microservice: Notification Service
+build:notification-service:
+  <<: *service_definition
+  stage: build
+  script:
+    - cd services/notification-service
+    - docker build -t $CI_REGISTRY_IMAGE/notification-service:$CI_COMMIT_SHORT_SHA .
+    - docker push $CI_REGISTRY_IMAGE/notification-service:$CI_COMMIT_SHORT_SHA
+  only:
+    changes:
+      - services/notification-service/**/*
+
+# Unit Tests for each service
+test:api-gateway:
+  image: node:18-alpine
+  stage: test
+  script:
+    - cd services/api-gateway
+    - npm ci
+    - npm run test:unit -- --coverage
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: services/api-gateway/coverage/cobertura-coverage.xml
+  only:
+    changes:
+      - services/api-gateway/**/*
+
+test:user-service:
+  image: python:3.11-alpine
+  stage: test
+  script:
+    - cd services/user-service
+    - pip install -r requirements.txt
+    - pip install pytest pytest-cov
+    - pytest --cov=. --cov-report=xml
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: services/user-service/coverage.xml
+  only:
+    changes:
+      - services/user-service/**/*
+
+test:order-service:
+  image: golang:1.21-alpine
+  stage: test
+  script:
+    - cd services/order-service
+    - go mod download
+    - go test -v -coverprofile=coverage.out ./...
+    - go tool cover -func=coverage.out
+  only:
+    changes:
+      - services/order-service/**/*
+
+# Integration Tests
+test:integration:
+  image: docker/compose:latest
+  stage: test
+  services:
+    - docker:24-dind
+  script:
+    - docker compose -f docker-compose.test.yml up -d
+    - sleep 10
+    - docker compose -f docker-compose.test.yml run integration-tests
+  after_script:
+    - docker compose -f docker-compose.test.yml down
+  only:
+    - main
+    - develop
+
+# Security Scanning
+security:container-scan:
+  stage: security
+  image: aquasec/trivy:latest
+  script:
+    - trivy image --severity HIGH,CRITICAL $CI_REGISTRY_IMAGE/api-gateway:$CI_COMMIT_SHORT_SHA
+    - trivy image --severity HIGH,CRITICAL $CI_REGISTRY_IMAGE/user-service:$CI_COMMIT_SHORT_SHA
+    - trivy image --severity HIGH,CRITICAL $CI_REGISTRY_IMAGE/order-service:$CI_COMMIT_SHORT_SHA
+  allow_failure: true
+
+security:dependency-scan:
+  stage: security
+  image: node:18-alpine
+  script:
+    - cd services/api-gateway && npm audit --audit-level=high || true
+    - cd ../user-service && pip install safety && safety check || true
+    - cd ../order-service && go list -json -m all | docker run --rm -i sonatypecommunity/nancy:latest sleuth || true
+  allow_failure: true
+
+# Package - Tag images as latest for main branch
+package:tag-latest:
+  <<: *service_definition
+  stage: package
+  script:
+    - docker pull $CI_REGISTRY_IMAGE/api-gateway:$CI_COMMIT_SHORT_SHA
+    - docker tag $CI_REGISTRY_IMAGE/api-gateway:$CI_COMMIT_SHORT_SHA $CI_REGISTRY_IMAGE/api-gateway:latest
+    - docker push $CI_REGISTRY_IMAGE/api-gateway:latest
+
+    - docker pull $CI_REGISTRY_IMAGE/user-service:$CI_COMMIT_SHORT_SHA
+    - docker tag $CI_REGISTRY_IMAGE/user-service:$CI_COMMIT_SHORT_SHA $CI_REGISTRY_IMAGE/user-service:latest
+    - docker push $CI_REGISTRY_IMAGE/user-service:latest
+
+    - docker pull $CI_REGISTRY_IMAGE/order-service:$CI_COMMIT_SHORT_SHA
+    - docker tag $CI_REGISTRY_IMAGE/order-service:$CI_COMMIT_SHORT_SHA $CI_REGISTRY_IMAGE/order-service:latest
+    - docker push $CI_REGISTRY_IMAGE/order-service:latest
+
+    - docker pull $CI_REGISTRY_IMAGE/notification-service:$CI_COMMIT_SHORT_SHA
+    - >
+      docker tag
+      $CI_REGISTRY_IMAGE/notification-service:$CI_COMMIT_SHORT_SHA
+      $CI_REGISTRY_IMAGE/notification-service:latest
+    - docker push $CI_REGISTRY_IMAGE/notification-service:latest
+  only:
+    - main
+
+# Deploy to Development
+deploy:development:
+  stage: deploy
+  image: alpine/k8s:1.28.0
+  script:
+    - echo "Deploying to Development environment"
+    - kubectl config use-context development
+    - |
+      for service in api-gateway user-service order-service notification-service; do
+        kubectl set image deployment/$service $service=$CI_REGISTRY_IMAGE/$service:$CI_COMMIT_SHORT_SHA -n development
+        kubectl rollout status deployment/$service -n development
+      done
+  environment:
+    name: development
+    url: https://dev.your-domain.com
+  only:
+    - develop
+
+# Deploy to Staging
+deploy:staging:
+  stage: deploy
+  image: alpine/k8s:1.28.0
+  script:
+    - echo "Deploying to Staging environment"
+    - kubectl config use-context staging
+    - |
+      for service in api-gateway user-service order-service notification-service; do
+        kubectl set image deployment/$service $service=$CI_REGISTRY_IMAGE/$service:$CI_COMMIT_SHORT_SHA -n staging
+        kubectl rollout status deployment/$service -n staging
+      done
+  environment:
+    name: staging
+    url: https://staging.your-domain.com
+  only:
+    - main
+  when: manual
+
+# Deploy to Production
+deploy:production:
+  stage: deploy
+  image: alpine/k8s:1.28.0
+  script:
+    - echo "Deploying to Production environment"
+    - kubectl config use-context production
+    - |
+      for service in api-gateway user-service order-service notification-service; do
+        kubectl set image deployment/$service $service=$CI_REGISTRY_IMAGE/$service:$CI_COMMIT_SHORT_SHA -n production
+        kubectl rollout status deployment/$service -n production
+      done
+    - echo "Health check..."
+    - curl -f https://api.your-domain.com/health || exit 1
+  environment:
+    name: production
+    url: https://api.your-domain.com
+  only:
+    - main
+  when: manual
+  needs:
+    - deploy:staging
+
+# Rollback job
+rollback:production:
+  stage: deploy
+  image: alpine/k8s:1.28.0
+  script:
+    - echo "Rolling back Production deployment"
+    - kubectl config use-context production
+    - |
+      for service in api-gateway user-service order-service notification-service; do
+        kubectl rollout undo deployment/$service -n production
+        kubectl rollout status deployment/$service -n production
+      done
+  environment:
+    name: production
+    action: rollback
+  only:
+    - main
+  when: manual

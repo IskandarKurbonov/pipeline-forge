@@ -1,0 +1,215 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_REGISTRY = 'docker.io'
+        IMAGE_NAME = 'myapp'
+        DOCKER_IMAGE = "${DOCKER_REGISTRY}/${IMAGE_NAME}"
+        TRIVY_VERSION = '0.45.0'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+        timeout(time: 45, unit: 'MINUTES')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    echo "Checking out code..."
+                    checkout scm
+                }
+            }
+        }
+
+        stage('Validate Dockerfile') {
+            steps {
+                script {
+                    echo "Validating Dockerfile..."
+                    sh """
+                        if [ ! -f Dockerfile ]; then
+                            echo "ERROR: Dockerfile not found!"
+                            exit 1
+                        fi
+                        # Lint Dockerfile with hadolint
+                        docker run --rm -i hadolint/hadolint < Dockerfile || true
+                    """
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    echo "Building Docker image..."
+                    sh """
+                        docker build \\
+                            --build-arg BUILD_DATE=\$(date -u +'%Y-%m-%dT%H:%M:%SZ') \\
+                            --build-arg VCS_REF=\${GIT_COMMIT} \\
+                            --build-arg BUILD_VERSION=\${BUILD_NUMBER} \\
+                            -t ${DOCKER_IMAGE}:${BUILD_NUMBER} \\
+                            -t ${DOCKER_IMAGE}:latest \\
+                            .
+                    """
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                script {
+                    echo "Scanning image for vulnerabilities with Trivy..."
+                    sh """
+                        # Install Trivy if not present
+                        which trivy || {
+                            wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+                            echo "deb https://aquasecurity.github.io/trivy-repo/deb \$(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+                            sudo apt-get update
+                            sudo apt-get install trivy
+                        }
+
+                        # Scan the image
+                        trivy image \\
+                            --severity HIGH,CRITICAL \\
+                            --format table \\
+                            --exit-code 0 \\
+                            ${DOCKER_IMAGE}:${BUILD_NUMBER}
+
+                        # Generate JSON report
+                        trivy image \\
+                            --severity HIGH,CRITICAL \\
+                            --format json \\
+                            --output trivy-report.json \\
+                            ${DOCKER_IMAGE}:${BUILD_NUMBER}
+                    """
+                }
+            }
+        }
+
+        stage('Image Metadata') {
+            steps {
+                script {
+                    echo "Inspecting Docker image..."
+                    sh """
+                        docker images ${DOCKER_IMAGE}:${BUILD_NUMBER}
+                        docker inspect ${DOCKER_IMAGE}:${BUILD_NUMBER} | jq '.[0] | {Id, Size, Architecture, Os, Created}'
+                    """
+                }
+            }
+        }
+
+        stage('Run Container Tests') {
+            steps {
+                script {
+                    echo "Testing container startup..."
+                    sh """
+                        # Start container
+                        CONTAINER_ID=\$(docker run -d --name test-${BUILD_NUMBER} ${DOCKER_IMAGE}:${BUILD_NUMBER})
+
+                        # Wait for container to be ready
+                        sleep 5
+
+                        # Check if container is running
+                        docker ps | grep test-${BUILD_NUMBER} || {
+                            echo "Container failed to start"
+                            docker logs test-${BUILD_NUMBER}
+                            exit 1
+                        }
+
+                        # Run health check if available
+                        # docker exec test-${BUILD_NUMBER} curl -f http://localhost/health || true
+
+                        # Cleanup
+                        docker stop test-${BUILD_NUMBER}
+                        docker rm test-${BUILD_NUMBER}
+                    """
+                }
+            }
+        }
+
+        stage('Push to Registry') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    echo "Pushing image to Docker registry..."
+                    withCredentials([usernamePassword(
+                        credentialsId: 'docker-registry-credentials',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )]) {
+                        sh """
+                            echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin ${DOCKER_REGISTRY}
+
+                            # Push both tags
+                            docker push ${DOCKER_IMAGE}:${BUILD_NUMBER}
+                            docker push ${DOCKER_IMAGE}:latest
+
+                            # Create git tag
+                            docker tag ${DOCKER_IMAGE}:${BUILD_NUMBER} ${DOCKER_IMAGE}:git-\${GIT_COMMIT:0:7}
+                            docker push ${DOCKER_IMAGE}:git-\${GIT_COMMIT:0:7}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Deploy') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    echo "Deploying Docker container..."
+                    sh """
+                        # Example: Deploy to Kubernetes
+                        # kubectl set image deployment/myapp myapp=${DOCKER_IMAGE}:${BUILD_NUMBER}
+                        # kubectl rollout status deployment/myapp
+
+                        # Example: Deploy using Docker Compose
+                        # export IMAGE_TAG=${BUILD_NUMBER}
+                        # docker-compose -f docker-compose.prod.yml up -d
+
+                        echo "Deployment completed"
+                    """
+                }
+            }
+        }
+
+        stage('Verify Deployment') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    echo "Verifying deployment..."
+                    sh """
+                        # Add verification commands
+                        # curl -f http://your-app-url/health || exit 1
+                        echo "Deployment verification passed"
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Docker build pipeline completed successfully!"
+            echo "Image: ${DOCKER_IMAGE}:${BUILD_NUMBER}"
+        }
+        failure {
+            echo "Docker build pipeline failed!"
+        }
+        always {
+            // Cleanup old images
+            sh """
+                docker images ${DOCKER_IMAGE} --filter "dangling=true" -q | xargs -r docker rmi || true
+            """
+            cleanWs()
+        }
+    }
+}

@@ -1,0 +1,110 @@
+pipeline {
+    agent any
+
+    environment {
+        APP_NAME = 'my-application'
+        DOCKER_REGISTRY = 'docker.io'
+        DOCKER_IMAGE = "${DOCKER_REGISTRY}/${APP_NAME}"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo "Checking out source code..."
+                checkout scm
+            }
+        }
+
+        stage('Build') {
+            steps {
+                echo "Building application..."
+                sh '''
+                    npm install
+                    npm run build
+                '''
+            }
+        }
+
+        stage('Test') {
+            steps {
+                echo "Running tests..."
+                sh 'npm test'
+            }
+        }
+
+        stage('Deploy to Development') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                echo "Deploying to Development environment..."
+                sh '''
+                    docker build -t ${DOCKER_IMAGE}:dev-${BUILD_NUMBER} .
+                    docker push ${DOCKER_IMAGE}:dev-${BUILD_NUMBER}
+                '''
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                branch 'main'
+            }
+            steps {
+                input message: 'Deploy to Staging?', ok: 'Deploy'
+                echo "Deploying to Staging environment..."
+                sh '''
+                    docker build -t ${DOCKER_IMAGE}:staging-${BUILD_NUMBER} .
+                    docker push ${DOCKER_IMAGE}:staging-${BUILD_NUMBER}
+                '''
+            }
+        }
+
+        stage('Integration Tests') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo "Running integration tests on Staging..."
+                sh 'npm run test:integration'
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                input message: 'Deploy to Production?', ok: 'Deploy'
+                echo "Deploying to Production environment..."
+                sh '''
+                    docker build -t ${DOCKER_IMAGE}:prod-${BUILD_NUMBER} .
+                    docker tag ${DOCKER_IMAGE}:prod-${BUILD_NUMBER} ${DOCKER_IMAGE}:latest
+                    docker push ${DOCKER_IMAGE}:prod-${BUILD_NUMBER}
+                    docker push ${DOCKER_IMAGE}:latest
+                '''
+            }
+        }
+
+        stage('Production Health Check') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo "Verifying production deployment..."
+                sh 'curl -f https://myapp.com/health || exit 1'
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Pipeline completed successfully!"
+        }
+        failure {
+            echo "Pipeline failed!"
+        }
+        always {
+            cleanWs()
+        }
+    }
+}

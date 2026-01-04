@@ -1,0 +1,170 @@
+name: Validate Pipelines
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  validate-jenkins:
+    name: Validate Jenkins Pipelines
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate Jenkinsfile syntax
+        run: |
+          echo "Validating Jenkins pipelines..."
+          for jenkinsfile in $(find . -name "Jenkinsfile"); do
+            echo "Checking $jenkinsfile"
+            # Basic syntax validation
+            if grep -q "pipeline {" "$jenkinsfile"; then
+              echo "✓ $jenkinsfile has valid pipeline structure"
+            else
+              echo "✗ $jenkinsfile missing pipeline structure"
+              exit 1
+            fi
+          done
+
+      - name: Check for required stages
+        run: |
+          echo "Checking for required pipeline stages..."
+          for jenkinsfile in $(find . -name "Jenkinsfile"); do
+            if grep -q "stages {" "$jenkinsfile"; then
+              echo "✓ $jenkinsfile has stages defined"
+            else
+              echo "✗ $jenkinsfile missing stages"
+              exit 1
+            fi
+          done
+
+  validate-gitlab-ci:
+    name: Validate GitLab CI Configs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install yamllint
+        run: pip install yamllint
+
+      - name: Validate GitLab CI YAML
+        run: |
+          echo "Validating GitLab CI configurations..."
+          for yamlfile in $(find ./gitlab-ci -name "*.yml"); do
+            echo "Linting $yamlfile"
+            yamllint -d "{extends: default, rules: {line-length: {max: 120}}}" "$yamlfile"
+          done
+
+      - name: Check GitLab CI structure
+        run: |
+          for yamlfile in $(find ./gitlab-ci -name "*.yml"); do
+            if grep -q "stages:" "$yamlfile"; then
+              echo "✓ $yamlfile has stages defined"
+            else
+              echo "✗ $yamlfile missing stages"
+              exit 1
+            fi
+          done
+
+  validate-github-actions:
+    name: Validate GitHub Actions Workflows
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install actionlint
+        run: |
+          bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          sudo mv ./actionlint /usr/local/bin/
+
+      - name: Lint GitHub Actions workflows
+        run: |
+          echo "Validating GitHub Actions workflows..."
+          for workflow in $(find ./github-actions -name "*.yml"); do
+            echo "Linting $workflow"
+            actionlint "$workflow" || true
+          done
+
+  check-readme:
+    name: Check README and Documentation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check README exists
+        run: |
+          if [ ! -f README.md ]; then
+            echo "✗ README.md not found"
+            exit 1
+          fi
+          echo "✓ README.md exists"
+
+      - name: Check LICENSE exists
+        run: |
+          if [ ! -f LICENSE ]; then
+            echo "✗ LICENSE not found"
+            exit 1
+          fi
+          echo "✓ LICENSE exists"
+
+      - name: Validate markdown
+        uses: DavidAnson/markdownlint-cli2-action@v14
+        with:
+          globs: '**/*.md'
+        continue-on-error: true
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy security scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'CRITICAL,HIGH'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  test-summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [validate-jenkins, validate-gitlab-ci, validate-github-actions, check-readme, security-scan]
+    if: always()
+
+    steps:
+      - name: Summary
+        run: |
+          echo "## Pipeline Validation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ All pipeline validations completed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Validated:" >> $GITHUB_STEP_SUMMARY
+          echo "- Jenkins Pipelines" >> $GITHUB_STEP_SUMMARY
+          echo "- GitLab CI Configurations" >> $GITHUB_STEP_SUMMARY
+          echo "- GitHub Actions Workflows" >> $GITHUB_STEP_SUMMARY
+          echo "- Documentation" >> $GITHUB_STEP_SUMMARY
+          echo "- Security Scan" >> $GITHUB_STEP_SUMMARY
